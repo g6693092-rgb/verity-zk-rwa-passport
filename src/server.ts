@@ -8,6 +8,7 @@ import { exec } from 'child_process';
 import snarkjs from 'snarkjs';
 import dotenv from 'dotenv';
 import { ethers } from 'ethers';
+import * as circomlibjs from 'circomlibjs';
 
 dotenv.config();
 
@@ -15,6 +16,8 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const SAMPLE_DIR = path.resolve(process.cwd(), 'sample');
 const PROOFS_DIR = path.resolve(process.cwd(), 'proofs');
+
+const poseidonFactory = (circomlibjs as any).default ?? (circomlibjs as any);
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 if (!fs.existsSync(SAMPLE_DIR)) fs.mkdirSync(SAMPLE_DIR);
@@ -32,13 +35,41 @@ function loadJson(filePath: string) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
-function commitmentOfClaim(claim: any) {
+function keccakCommitmentOfClaim(claim: any) {
   const payload = JSON.stringify(claim);
   const hash = keccak256(Buffer.from(payload));
   return '0x' + hash.toString('hex');
 }
 
-app.post('/claims', (req, res) => {
+async function poseidonFieldFromClaim(claim: any): Promise<bigint> {
+  const poseidon = await poseidonFactory();
+  const hash = keccak256(Buffer.from(JSON.stringify(claim)));
+  const fieldValue = BigInt('0x' + hash.toString('hex'));
+  const out = poseidon([fieldValue]);
+  return BigInt(poseidon.F.toString(out));
+}
+
+function toBytes32Hex(value: bigint): Buffer {
+  const hex = value.toString(16).padStart(64, '0');
+  return Buffer.from(hex, 'hex');
+}
+
+async function buildPoseidonMerkleFromIndex(index: Array<any>) {
+  const leaves: Buffer[] = [];
+  const idToLeaf: Record<string, Buffer> = {};
+  for (const item of index) {
+    const claim = loadJson(path.join(DATA_DIR, `${item.id}.json`));
+    const field = await poseidonFieldFromClaim(claim);
+    const buf = toBytes32Hex(field);
+    leaves.push(buf);
+    idToLeaf[item.id] = buf;
+  }
+  const tree = new MerkleTree(leaves, (x: Buffer) => x, { sortPairs: true });
+  const root = '0x' + tree.getRoot().toString('hex');
+  return { tree, root, idToLeaf };
+}
+
+app.post('/claims', async (req, res) => {
   try {
     const claim = req.body;
     if (!claim) return res.status(400).json({ error: 'Empty body' });
@@ -48,15 +79,15 @@ app.post('/claims', (req, res) => {
     const filename = path.join(DATA_DIR, `${id}.json`);
     saveJson(filename, claim);
 
-    const commitment = commitmentOfClaim(claim);
+    const commitment = keccakCommitmentOfClaim(claim);
+    const poseidonLeaf = await poseidonFieldFromClaim(claim);
 
-    // index
     const indexPath = path.join(DATA_DIR, 'index.json');
     const index = loadJson(indexPath) || [];
-    index.push({ id, commitment });
+    index.push({ id, commitment, poseidonLeaf: poseidonLeaf.toString(10) });
     saveJson(indexPath, index);
 
-    return res.json({ id, commitment });
+    return res.json({ id, commitment, poseidonLeaf: poseidonLeaf.toString(10) });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
@@ -70,24 +101,45 @@ app.get('/claims/:id', (req, res) => {
   return res.json(claim);
 });
 
-app.post('/batch', (req, res) => {
+app.post('/batch', async (req, res) => {
   try {
     const indexPath = path.join(DATA_DIR, 'index.json');
     const index = loadJson(indexPath) || [];
     if (index.length === 0) return res.status(400).json({ error: 'No claims to batch' });
 
-    const leaves = index.map((item: any) => Buffer.from(item.commitment.replace(/^0x/, ''), 'hex'));
-    const tree = new MerkleTree(leaves, keccak256, { sortPairs: true });
-    const root = '0x' + tree.getRoot().toString('hex');
+    const { root } = await buildPoseidonMerkleFromIndex(index);
 
-    // store batch
     const batchesPath = path.join(DATA_DIR, 'batches.json');
     const batches = loadJson(batchesPath) || [];
-    const batch = { id: `batch-${uuidv4()}`, root, timestamp: new Date().toISOString(), count: leaves.length };
+    const batch = { id: `batch-${uuidv4()}`, root, timestamp: new Date().toISOString(), count: index.length };
     batches.push(batch);
     saveJson(batchesPath, batches);
 
     return res.json({ batch });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Inclusion proof endpoint: returns pathElements and pathIndices for a claim in the current index
+app.post('/batch/inclusion', async (req, res) => {
+  try {
+    const { claimId } = req.body;
+    if (!claimId) return res.status(400).json({ error: 'claimId required' });
+
+    const indexPath = path.join(DATA_DIR, 'index.json');
+    const index = loadJson(indexPath) || [];
+    if (index.length === 0) return res.status(400).json({ error: 'No claims indexed' });
+
+    const { tree, idToLeaf, root } = await buildPoseidonMerkleFromIndex(index);
+    const leaf = idToLeaf[claimId];
+    if (!leaf) return res.status(404).json({ error: 'Claim not found in index' });
+
+    const proof = tree.getProof(leaf);
+    const pathElements = proof.map((p: any) => '0x' + p.data.toString('hex'));
+    const pathIndices = proof.map((p: any) => (p.position === 'left' ? 0 : 1));
+
+    return res.json({ root, leaf: '0x' + leaf.toString('hex'), pathElements, pathIndices });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
@@ -102,7 +154,6 @@ app.post('/prove', async (req, res) => {
 
     const claim = loadJson(filename);
 
-    // prepare input for circuit: samples array length must be 16 (padding)
     const maxSamples = 16;
     const samples = (claim.temperatureSamples || []).slice(0, maxSamples).map((v: number) => Math.round(v));
     while (samples.length < maxSamples) samples.push(0);
@@ -112,7 +163,6 @@ app.post('/prove', async (req, res) => {
     const inputPath = path.join(SAMPLE_DIR, 'input-cold-chain.json');
     saveJson(inputPath, input);
 
-    // run proof script
     const script = path.join(process.cwd(), 'scripts', 'run-cold-chain-proof.sh');
     if (!fs.existsSync(script)) return res.status(500).json({ error: 'Proof script not found' });
 
@@ -122,7 +172,6 @@ app.post('/prove', async (req, res) => {
         return res.status(500).json({ error: 'Proof generation failed', details: stderr });
       }
 
-      // read proofs
       const proofPath = path.join(PROOFS_DIR, 'proof.json');
       const publicPath = path.join(PROOFS_DIR, 'public.json');
       const vkPath = path.join(PROOFS_DIR, 'verification_key.json');
@@ -134,41 +183,43 @@ app.post('/prove', async (req, res) => {
       const publicSignals = loadJson(publicPath);
       const vKey = loadJson(vkPath);
 
-      // verify locally using snarkjs
-      const valid = await snarkjs.groth16.verify(vKey, publicSignals, proof);
+      const valid = await snarkjs.plonk.verify(vKey, publicSignals, proof).catch(async () => {
+        // fallback to groth16 verify if verification token differs; keep compatibility
+        return await snarkjs.groth16.verify(vKey, publicSignals, proof);
+      });
 
-      // return artifacts (small) and verification result
       return res.json({ valid, publicSignals, proof });
     });
-
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-// New: POST /verify accepts proof, publicSignals and vk in the request body (or paths) and performs verification + optional on-chain anchor check
 app.post('/verify', async (req, res) => {
   try {
     const { proof, publicSignals, vk, root, rpc, contract } = req.body;
 
+    let proofObj = proof;
+    let publicObj = publicSignals;
     let vKey = vk;
-    if (typeof vKey === 'string' && vKey.endsWith('.json')) {
-      vKey = loadJson(path.resolve(vKey));
+
+    if (typeof proofObj === 'string' && proofObj.endsWith('.json')) proofObj = loadJson(path.resolve(proofObj));
+    if (typeof publicObj === 'string' && publicObj.endsWith('.json')) publicObj = loadJson(path.resolve(publicObj));
+    if (typeof vKey === 'string' && vKey.endsWith('.json')) vKey = loadJson(path.resolve(vKey));
+
+    if (!proofObj || !publicObj || !vKey) {
+      return res.status(400).json({ error: 'proof, publicSignals and vk are required' });
     }
 
-    // If proof/public/vk are paths under proofs/ return usage instructions
-    let proofObj = proof;
-    if (typeof proof === 'string' && proof.endsWith('.json')) proofObj = loadJson(path.resolve(proof));
-    let publicObj = publicSignals;
-    if (typeof publicSignals === 'string' && publicSignals.endsWith('.json')) publicObj = loadJson(path.resolve(publicSignals));
+    let valid = false;
+    // try PLONK verify first
+    try {
+      valid = await snarkjs.plonk.verify(vKey, publicObj, proofObj);
+    } catch (e) {
+      // fallback to groth16
+      valid = await snarkjs.groth16.verify(vKey, publicObj, proofObj);
+    }
 
-    if (!proofObj || !publicObj || !vKey) return res.status(400).json({ error: 'proof, publicSignals and vk are required (object or path)' });
-
-    const valid = await snarkjs.groth16.verify(vKey, publicObj, proofObj);
-
-    let anchored = null;
-    let normalized = null;
-    // detect root in public signals if not provided
     let detectedRoot = root;
     if (!detectedRoot) {
       for (const s of publicObj) {
@@ -183,20 +234,14 @@ app.post('/verify', async (req, res) => {
       }
     }
 
-    if (detectedRoot) {
-      // normalize to bytes32
-      try {
-        if (detectedRoot.startsWith('0x')) {
-          normalized = ethers.utils.hexZeroPad(detectedRoot, 32);
-        } else if (/^[0-9]+$/.test(detectedRoot)) {
-          normalized = ethers.utils.hexZeroPad(ethers.utils.hexlify(ethers.BigNumber.from(detectedRoot)), 32);
-        }
-      } catch (e) {
-        normalized = null;
-      }
+    let anchored = null;
+    let normalized = null;
 
+    if (detectedRoot) {
+      normalized = normalizeRoot(detectedRoot);
       const rpcUrl = rpc || process.env.VECHAIN_TESTNET_RPC || process.env.VECHAIN_MAINNET_RPC;
       const contractAddr = contract || process.env.ROOT_REGISTRY;
+
       if (normalized && rpcUrl && contractAddr) {
         const chainId = rpcUrl.includes('testnet') ? 100010 : 100009;
         const provider = new ethers.providers.JsonRpcProvider(rpcUrl, { name: 'vechain', chainId });
@@ -211,6 +256,16 @@ app.post('/verify', async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+function normalizeRoot(value: string) {
+  if (!value) return null;
+  if (value.startsWith('0x')) return ethers.utils.hexZeroPad(value, 32);
+  if (/^[0-9]+$/.test(value)) {
+    return ethers.utils.hexZeroPad(ethers.utils.hexlify(ethers.BigNumber.from(value)), 32);
+  }
+  if (/^[0-9a-fA-F]+$/.test(value)) return ethers.utils.hexZeroPad('0x' + value, 32);
+  return null;
+}
 
 app.post('/anchor', async (req, res) => {
   try {
@@ -232,7 +287,6 @@ app.post('/anchor', async (req, res) => {
     const tx = await contract.anchorRoot(root, schemaId, { gasLimit: 500000 });
     await tx.wait();
 
-    // record anchor
     const anchorsPath = path.join(DATA_DIR, 'anchors.json');
     const anchors = loadJson(anchorsPath) || [];
     anchors.push({ root, txHash: tx.hash, schemaId, timestamp: new Date().toISOString() });
