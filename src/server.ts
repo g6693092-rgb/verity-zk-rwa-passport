@@ -146,6 +146,72 @@ app.post('/prove', async (req, res) => {
   }
 });
 
+// New: POST /verify accepts proof, publicSignals and vk in the request body (or paths) and performs verification + optional on-chain anchor check
+app.post('/verify', async (req, res) => {
+  try {
+    const { proof, publicSignals, vk, root, rpc, contract } = req.body;
+
+    let vKey = vk;
+    if (typeof vKey === 'string' && vKey.endsWith('.json')) {
+      vKey = loadJson(path.resolve(vKey));
+    }
+
+    // If proof/public/vk are paths under proofs/ return usage instructions
+    let proofObj = proof;
+    if (typeof proof === 'string' && proof.endsWith('.json')) proofObj = loadJson(path.resolve(proof));
+    let publicObj = publicSignals;
+    if (typeof publicSignals === 'string' && publicSignals.endsWith('.json')) publicObj = loadJson(path.resolve(publicSignals));
+
+    if (!proofObj || !publicObj || !vKey) return res.status(400).json({ error: 'proof, publicSignals and vk are required (object or path)' });
+
+    const valid = await snarkjs.groth16.verify(vKey, publicObj, proofObj);
+
+    let anchored = null;
+    let normalized = null;
+    // detect root in public signals if not provided
+    let detectedRoot = root;
+    if (!detectedRoot) {
+      for (const s of publicObj) {
+        if (typeof s === 'string' && s.startsWith('0x') && s.length <= 66) {
+          detectedRoot = s;
+          break;
+        }
+        if (typeof s === 'string' && /^[0-9a-fA-F]+$/.test(s) && s.length <= 64) {
+          detectedRoot = '0x' + s;
+          break;
+        }
+      }
+    }
+
+    if (detectedRoot) {
+      // normalize to bytes32
+      try {
+        if (detectedRoot.startsWith('0x')) {
+          normalized = ethers.utils.hexZeroPad(detectedRoot, 32);
+        } else if (/^[0-9]+$/.test(detectedRoot)) {
+          normalized = ethers.utils.hexZeroPad(ethers.utils.hexlify(ethers.BigNumber.from(detectedRoot)), 32);
+        }
+      } catch (e) {
+        normalized = null;
+      }
+
+      const rpcUrl = rpc || process.env.VECHAIN_TESTNET_RPC || process.env.VECHAIN_MAINNET_RPC;
+      const contractAddr = contract || process.env.ROOT_REGISTRY;
+      if (normalized && rpcUrl && contractAddr) {
+        const chainId = rpcUrl.includes('testnet') ? 100010 : 100009;
+        const provider = new ethers.providers.JsonRpcProvider(rpcUrl, { name: 'vechain', chainId });
+        const abi = ['function isAnchored(bytes32 root) view returns (bool)'];
+        const c = new ethers.Contract(contractAddr, abi, provider);
+        anchored = await c.isAnchored(normalized);
+      }
+    }
+
+    return res.json({ valid, anchored, normalized, publicSignals: publicObj });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/anchor', async (req, res) => {
   try {
     const root = req.body.root;
